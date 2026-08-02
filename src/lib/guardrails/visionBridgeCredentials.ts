@@ -5,18 +5,25 @@
  * (visionBridge.ts already imports getBestVisionModel from visionBridgeRouter.ts).
  */
 
+import {
+  isAccountUnavailable,
+  isModelLocked,
+} from "@omniroute/open-sse/services/accountFallback.ts";
+
 /**
  * True when a provider connection can actually authenticate upstream.
  * `noauth` with no real API key is NOT usable (opencode-zen free tier often
  * surfaces as noauth and then 401 "Missing API key").
  */
 export type ProviderConnectionLike = {
+  id?: string | null;
   authType?: string | null;
   apiKey?: string | null;
   accessToken?: string | null;
   refreshToken?: string | null;
   idToken?: string | null;
   testStatus?: string | null;
+  rateLimitedUntil?: string | null;
 };
 
 const TERMINAL_CONNECTION_STATUSES = new Set(["disabled", "banned", "expired"]);
@@ -39,6 +46,14 @@ function hasOAuthCredential(connection: ProviderConnectionLike): boolean {
 export function isProviderConnectionUsable(connection: ProviderConnectionLike): boolean {
   const status = String(connection.testStatus || "").toLowerCase();
   if (TERMINAL_CONNECTION_STATUSES.has(status)) {
+    return false;
+  }
+
+  // A connection still inside its rate-limit cooldown cannot serve a describe
+  // call either — without this check the Vision Bridge could keep selecting a
+  // cooling model (e.g. a rate-limited Gemini account) and surface 429
+  // "All credentials ... cooling down" to the chat handler.
+  if (isAccountUnavailable(connection.rateLimitedUntil)) {
     return false;
   }
 
@@ -78,9 +93,20 @@ function loadProvidersModule(): Promise<typeof import("@/lib/db/providers")> {
 /**
  * Resolve whether `provider/model` has at least one usable active connection.
  * Returns `null` when the credential store is unavailable (unit tests / early boot).
+ *
+ * A connection counts as usable only when it can authenticate upstream AND is
+ * not currently cooling down (`rateLimitedUntil` in the future) AND the
+ * specific model is not under a model-level lockout. This mirrors the
+ * credential-selection predicates in auth.ts / accountFallback.ts so the
+ * Vision Bridge never picks a model whose only accounts are rate-limited —
+ * previously that selected a cooling model, the describe call 429'd with
+ * `model_cooldown`, and the guardrail's fallback forwarded the raw image to a
+ * text-only backend, which rejected it with an opaque upstream error.
  */
 export async function hasUsableCredentialsForModel(model: string): Promise<boolean | null> {
-  const provider = typeof model === "string" ? model.split("/")[0]?.trim() : "";
+  const parts = typeof model === "string" ? model.split("/") : [];
+  const provider = parts[0]?.trim() ?? "";
+  const modelId = parts.slice(1).join("/").trim();
   if (!provider) return null;
   try {
     const { getProviderConnections } = await loadProvidersModule();
@@ -88,7 +114,9 @@ export async function hasUsableCredentialsForModel(model: string): Promise<boole
     if (!Array.isArray(connections)) return null;
     // Empty active set is a definitive "no" only when the table is readable.
     if (connections.length === 0) return false;
-    return connections.some((c: any) => isProviderConnectionUsable(c));
+    return connections.some(
+      (c: any) => isProviderConnectionUsable(c) && !isModelLocked(provider, c.id, modelId || null)
+    );
   } catch {
     return null;
   }
