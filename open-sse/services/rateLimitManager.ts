@@ -9,6 +9,7 @@
  */
 
 import Bottleneck from "bottleneck";
+import { toNumber } from "@/shared/utils/numeric";
 import { parseRetryAfterFromBody } from "./accountFallback.ts";
 import { getAntigravityQuotaFamily } from "./antigravityQuotaFamily.ts";
 import { getProviderCategory } from "../config/providerRegistry.ts";
@@ -48,16 +49,6 @@ type JsonRecord = Record<string, unknown>;
 
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-function toNumber(value: unknown, fallback = 0): number {
-  const parsed =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && value.trim().length > 0
-        ? Number(value)
-        : Number.NaN;
-  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function isNodeTestRunnerChild(): boolean {
@@ -104,14 +95,24 @@ let currentRequestQueueSettings: RequestQueueSettings = DEFAULT_RESILIENCE_SETTI
 // jobs are dispatched). When the reservoir/refresh state desyncs from reality,
 // this catches it and force-resets so traffic isn't stuck forever.
 const lastDispatchAt = new Map<string, number>();
+// Tracks the rate-limit timing settings we last applied to each limiter
+// (minTime / reservoirRefreshInterval). Bottleneck exposes no public getter
+// for current settings, so we mirror the values we push via updateSettings()
+// to size the wedge threshold per limiter.
+const limiterTiming = new Map<string, { minTime: number; reservoirRefreshIntervalMs: number }>();
 let watchdogInterval: ReturnType<typeof setInterval> | null = null;
 const WATCHDOG_INTERVAL_MS = 30_000;
-// Threshold has to exceed any *legitimate* gap between dispatches:
-//  - default reservoirRefreshInterval is 60s
-//  - adaptive minTime can climb to ~60s for 1-RPM providers (see updateFromHeaders)
-// 120s gives a 2× margin against both, while still catching the actual wedge
-// case we observed (queue stalled for 3+ minutes with no progress).
-const WEDGE_THRESHOLD_MS = 120_000;
+// Wedge detection must NOT flag a limiter that is *legitimately* spacing out
+// requests. The effective threshold is computed per limiter as:
+//   max(WEDGE_THRESHOLD_MS, minTime + WEDGE_MARGIN_MS)
+// with minTime being the currently applied value (0 for unlimited, up to ~60s
+// for 1-RPM providers learned from headers). The floor (20s) gives the fast
+// wedge recovery observed in the field (429 → stuck queue for 2-3 min before
+// fallback), while the minTime term prevents false positives on slow-but-healthy
+// providers. A fixed 20s would wrongly force-reset a 1-RPM provider whose queued
+// job is merely waiting out its learned minTime gap.
+const WEDGE_THRESHOLD_MS = 20_000;
+const WEDGE_MARGIN_MS = 10_000;
 
 /**
  * Env-var override for the auto-enable safety net. Highest priority — wins
@@ -164,10 +165,25 @@ function buildLimiterDefaults() {
   };
 }
 
+function updateLimiterTiming(key: string, settings: LimiterUpdateSettings): void {
+  limiterTiming.set(key, {
+    minTime: typeof settings.minTime === "number" && settings.minTime >= 0 ? settings.minTime : 0,
+    reservoirRefreshIntervalMs:
+      typeof settings.reservoirRefreshInterval === "number" && settings.reservoirRefreshInterval > 0
+        ? settings.reservoirRefreshInterval
+        : 0,
+  });
+}
+
+function clearLimiterTiming(key: string): void {
+  limiterTiming.delete(key);
+}
+
 function updateAllLimiterSettings() {
   const defaults = buildLimiterDefaults();
-  for (const limiter of limiters.values()) {
+  for (const [key, limiter] of limiters) {
     limiter.updateSettings(defaults);
+    updateLimiterTiming(key, defaults as LimiterUpdateSettings);
   }
 }
 
@@ -235,6 +251,7 @@ function watchdogTick() {
         limiters.delete(key);
         lastDispatchAt.delete(key);
         limiterLastUsed.delete(key);
+        clearLimiterTiming(key);
         logRateLimit(
           `🧹 [RATE-LIMIT] Evicting idle limiter: ${key} (inactive for ${Math.round((now - lastUsed) / 1000)}s)`
         );
@@ -254,7 +271,14 @@ function watchdogTick() {
       continue;
     }
     const stalledMs = now - lastDispatch;
-    if (stalledMs < WEDGE_THRESHOLD_MS) continue;
+    // The threshold is sized to this limiter's legitimate spacing: a healthy
+    // slow limiter (e.g. 1-RPM provider with a learned minTime of ~60s) must
+    // not be force-reset while a queued job waits out that gap. Only queues
+    // stalled well past their own timing budget are wedged.
+    const timing = limiterTiming.get(key);
+    const legitGapMs = timing ? Math.max(timing.minTime, timing.reservoirRefreshIntervalMs) : 0;
+    const effectiveThreshold = Math.max(WEDGE_THRESHOLD_MS, legitGapMs + WEDGE_MARGIN_MS);
+    if (stalledMs < effectiveThreshold) continue;
 
     warnRateLimit(
       `🚨 [RATE-LIMIT] WEDGED: ${key} queued=${counts.QUEUED} running=0 executing=0 stalled=${stalledMs}ms — force-resetting`
@@ -313,6 +337,7 @@ function evictWedgeLimiter(key: string, limiter: Bottleneck): void {
   limiters.delete(key);
   lastDispatchAt.delete(key);
   limiterLastUsed.delete(key);
+  clearLimiterTiming(key);
   trackAsyncOperation(limiter.disconnect());
   trackAsyncOperation(
     limiter.stop({ dropWaitingJobs: true, dropErrorMessage: "rate-limit-watchdog-wedge-reset" })
@@ -333,6 +358,7 @@ function shutdownLimiters(): void {
   limiters.clear();
   lastDispatchAt.clear();
   limiterLastUsed.clear();
+  limiterTiming.clear();
 }
 
 // Only register shutdown handlers when there are active limiters to shut down.
@@ -532,6 +558,9 @@ function getLimiter(provider, connectionId, model = null) {
       ...defaults,
       id: key,
     });
+    // Mirror the effective timing so the wedge watchdog can size its threshold
+    // to this limiter's legitimately-slow spacing (see WEDGE_MARGIN_MS).
+    updateLimiterTiming(key, defaults as LimiterUpdateSettings);
     // Heartbeat: timestamp every dispatch so the watchdog can tell a healthy
     // queue (just dispatched a job) from a wedged one (queue has work but
     // nothing has been dispatched in a while).
@@ -734,6 +763,7 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
 
   const plainHeaders = toPlainHeaders(headers);
   const limiter = getLimiter(provider, connectionId, model);
+  const limiterKey = getLimiterKey(provider, connectionId, model);
   const headerMap =
     provider === "claude" || provider === "anthropic" ? ANTHROPIC_HEADERS : STANDARD_HEADERS;
 
@@ -752,7 +782,6 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
   if (status === 429) {
     const retryAfterMs = parseResetTime(retryAfterStr) || 60000; // Default 60s
     const counts = limiter.counts();
-    const limiterKey = getLimiterKey(provider, connectionId, model);
     logRateLimit(
       `🚫 [RATE-LIMIT] ${provider}:${connectionId.slice(0, 8)} — 429 received, pausing for ${Math.ceil(retryAfterMs / 1000)}s, dropping ${counts.QUEUED} queued request(s)`
     );
@@ -770,6 +799,7 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
     limiters.delete(limiterKey);
     lastDispatchAt.delete(limiterKey);
     limiterLastUsed.delete(limiterKey);
+    clearLimiterTiming(limiterKey);
     trackAsyncOperation(limiter.disconnect());
     return;
   }
@@ -782,6 +812,7 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
     limiter.updateSettings({
       minTime: 200, // Add 200ms between requests
     });
+    updateLimiterTiming(limiterKey, { minTime: 200 });
     return;
   }
 
@@ -813,6 +844,7 @@ export function updateFromHeaders(provider, connectionId, headers, status, model
     }
 
     limiter.updateSettings(updates);
+    updateLimiterTiming(limiterKey, updates);
 
     // Persist learned limits (debounced)
     recordLearnedLimit(
@@ -944,6 +976,7 @@ export async function __resetRateLimitManagerForTests() {
   initialized = false;
   lastDispatchAt.clear();
   limiterLastUsed.clear();
+  limiterTiming.clear();
   shutdownHandlersRegistered = false;
 
   for (const key of Object.keys(learnedLimits)) {
@@ -1015,6 +1048,7 @@ async function loadPersistedLimits() {
         if (limiter && limit > 0) {
           const inferredMinTime = minTime || Math.max(0, Math.floor(60000 / limit) - 10);
           limiter.updateSettings({ minTime: inferredMinTime });
+          updateLimiterTiming(key, { minTime: inferredMinTime });
           count++;
         }
       }
@@ -1053,6 +1087,10 @@ export function updateFromResponseBody(provider, connectionId, responseBody, sta
     limiter.updateSettings({
       reservoir: 0,
       reservoirRefreshAmount: 60,
+      reservoirRefreshInterval: retryAfterMs,
+    });
+    updateLimiterTiming(getLimiterKey(provider, connectionId, model), {
+      minTime: 0,
       reservoirRefreshInterval: retryAfterMs,
     });
   }

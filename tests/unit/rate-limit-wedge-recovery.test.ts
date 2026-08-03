@@ -121,3 +121,30 @@ test("watchdog wedge branch uses stop({ dropWaitingJobs: true }), not disconnect
     "wedge-recovery branch must not still call disconnect() — it doesn't reject queued jobs"
   );
 });
+
+test("wedge threshold is adaptive: 20s floor that grows for legitimately slow limiters", async () => {
+  const source = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../../open-sse/services/rateLimitManager.ts", import.meta.url), "utf8")
+  );
+
+  const thresholdDecl = source.match(/const WEDGE_THRESHOLD_MS = ([\d_]+);/);
+  assert.ok(thresholdDecl, "expected WEDGE_THRESHOLD_MS constant in rateLimitManager.ts");
+  assert.equal(
+    thresholdDecl[1],
+    "20_000",
+    "wedge floor should be ~20s so a 429-stuck queue triggers fallback in seconds, not minutes"
+  );
+
+  const effectiveThreshold = source.match(
+    /effectiveThreshold = Math\.max\(WEDGE_THRESHOLD_MS, legitGapMs \+ WEDGE_MARGIN_MS\)/
+  );
+  assert.ok(
+    effectiveThreshold,
+    "watchdog must size the threshold from the limiter's current timing (legitGapMs) so a " +
+      "healthy 1-RPM provider (learned minTime ~60s) is not falsely force-reset at the 20s floor"
+  );
+  assert.ok(
+    source.includes("const WEDGE_MARGIN_MS = 10_000;"),
+    "expected a WEDGE_MARGIN_MS margin constant above the learned timing"
+  );
+});
