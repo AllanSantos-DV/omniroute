@@ -20,6 +20,7 @@ import type { AutoVariant } from "./autoPrefix";
 import { buildFamilyCandidateFilter, type ModelFamily } from "./modelFamily";
 import { getHiddenModelsByProvider } from "@/models";
 import { filterPaidOnlyCandidates } from "./paidModelFilter";
+import { filterCredentialUnhealthyCandidates } from "./credentialHealthFilter";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { filterExcludedCandidates } from "./candidateOverrides";
 import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
@@ -427,13 +428,24 @@ export async function createVirtualAutoCombo(
   for (const conn of [...connections, ...disabledNoAuthConnections]) {
     connectionsById.set(conn.id, conn);
   }
-  const resilienceFilteredPool = filterResilienceBlockedCandidates(
-    candidatePool,
-    connectionsById
-  );
+  const resilienceFilteredPool = filterResilienceBlockedCandidates(candidatePool, connectionsById);
   if (resilienceFilteredPool !== candidatePool) {
     candidatePool.length = 0;
     candidatePool.push(...resilienceFilteredPool);
+  }
+
+  // Credential-health-aware pool: drop candidates whose connections the
+  // background CredentialHealth scheduler already flagged as broken (billing
+  // required, insufficient balance, model 404, expired token). The scheduler
+  // tests each connection every 5min; this makes `auto/*` pools reflect that
+  // reality instead of re-probing dead accounts at request time (LKGP stickiness
+  // kept hammering SambaNova billing / DeepSeek balance / NVIDIA 404). Fail-open:
+  // never-tested connections (undefined health) stay in the pool. Identity when
+  // nothing changed, so an unpopulated cache leaves the pool untouched.
+  const healthFilteredPool = filterCredentialUnhealthyCandidates(candidatePool);
+  if (healthFilteredPool !== candidatePool) {
+    candidatePool.length = 0;
+    candidatePool.push(...healthFilteredPool);
   }
 
   // #6512 (follow-up to #6328/#6495): when the operator opts into `hidePaidModels`,
