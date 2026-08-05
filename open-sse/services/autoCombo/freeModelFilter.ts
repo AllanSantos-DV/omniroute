@@ -4,7 +4,7 @@
  * The category/tier narrowing for `:free` (`suffixComposition.buildAutoCandidateFilter`)
  * decides "free" purely by price via `classifyTier` (tierResolver.ts → providerCostData),
  * so models the documented free catalog flags as needing a signup deposit or a credit
- * plan — `one-time-initial` (e.g. nvidia, deepseek) and `recurring-credit` — can slip
+ * plan — `one-time-initial` (e.g. deepseek, agentrouter) and `recurring-credit` — can slip
  * into an `auto/*:free` pool and then 402/403/404 at request time because the account
  * has no balance. That is exactly the "false free" failure mode.
  *
@@ -13,6 +13,11 @@
  * non-steady `freeType`. Models the catalog never documents (custom/synced rows, brand
  * new providers) pass through — fail-open, mirroring the credential-health and paid-only
  * filters, so a zero-setup pool is never emptied just because a provider is not listed.
+ *
+ * The compiled catalog is the source of truth, but an optional `overrides` map (populated
+ * by the DB-aware caller from `free_model_type_overrides`, migration 134) lets an operator
+ * reclassify a model's freeType at runtime — e.g. promoting nvidia to recurring-uncapped
+ * after it removed its signup credit cap — without rebuilding the catalog.
  *
  * Kept pure and dependency-light so it is unit-testable in isolation.
  */
@@ -30,24 +35,59 @@ export interface FreeTypeCandidate {
   model: string;
 }
 
-// provider::model → non-steady freeType, built once at module load.
-const NON_STEADY_MODEL_KEYS: ReadonlySet<string> = (() => {
-  const set = new Set<string>();
+/**
+ * Runtime override of each model's effective freeType, keyed by `provider::model`.
+ * Usually populated from `free_model_type_overrides` by the (DB-aware) caller so an
+ * operator can reclassify a model's freeType without rebuilding the compiled catalog.
+ * When present for a candidate, the override value REPLACES the compiled catalog's
+ * freeType for the non-steady decision. Absent → compiled value applies.
+ */
+export type FreeTypeOverrideMap = ReadonlyMap<string, string>;
+
+// provider::model → compiled freeType, built once at module load.
+const COMPILED_FREE_TYPES: ReadonlyMap<string, string> = (() => {
+  const map = new Map<string, string>();
   for (const m of FREE_MODEL_BUDGETS) {
-    if (NON_STEADY_FREE_TYPES.has(m.freeType) && m.modelId) {
-      set.add(`${m.provider}::${m.modelId}`);
-    }
+    if (m.modelId) map.set(`${m.provider}::${m.modelId}`, m.freeType);
   }
-  return set;
+  return map;
 })();
 
+/** The effective freeType for one candidate: runtime override wins over the compiled catalog. */
+export function isNonSteadyFreeCandidate(
+  provider: string,
+  model: string,
+  overrides: FreeTypeOverrideMap | undefined,
+  nonSteadyTypes: ReadonlySet<FreeModelFreeType>
+): boolean {
+  let freeType: string | undefined;
+  if (overrides) {
+    const key = `${provider}::${model}`;
+    freeType = overrides.get(key);
+  }
+  if (freeType === undefined) {
+    freeType = COMPILED_FREE_TYPES.get(`${provider}::${model}`);
+  }
+  // Absent from both the catalog and overrides → not flagged (fail-open): undocumented
+  // candidates pass through, mirroring the credential-health and paid-only filters.
+  return freeType !== undefined && nonSteadyTypes.has(freeType as FreeModelFreeType);
+}
+
 /**
- * Drop candidates whose provider/model the documented free catalog marks as requiring a
- * signup deposit or a credit plan. Returns the pool unchanged (identity) when nothing is
- * excluded; candidates never documented by the catalog always pass through (fail-open).
+ * Drop candidates whose documented free type is non-steady (requires a signup deposit or
+ * a credit plan to actually serve). An optional `overrides` map lets the caller reclassify
+ * specific `provider::model` entries at runtime (e.g. promote nvidia to recurring-uncapped)
+ * WITHOUT editing the compiled catalog. Returns the pool unchanged (identity) when nothing
+ * is excluded; candidates never documented AND never overridden always pass through
+ * (fail-open).
  */
-export function filterNonSteadyFreeCandidates<T extends FreeTypeCandidate>(pool: T[]): T[] {
+export function filterNonSteadyFreeCandidates<T extends FreeTypeCandidate>(
+  pool: T[],
+  overrides?: FreeTypeOverrideMap
+): T[] {
   if (pool.length === 0) return pool;
-  const kept = pool.filter((c) => !NON_STEADY_MODEL_KEYS.has(`${c.provider}::${c.model}`));
+  const kept = pool.filter(
+    (c) => !isNonSteadyFreeCandidate(c.provider, c.model, overrides, NON_STEADY_FREE_TYPES)
+  );
   return kept.length === pool.length ? pool : kept;
 }

@@ -317,6 +317,7 @@ export type { BatchItemCheckpoint, BatchRecord } from "./db/batches";
 export type { ModelComboMapping } from "./db/modelComboMappings";
 export * from "./db/reasoningRoutingRules";
 export * from "./db/autoCandidateOverrides";
+export * from "./db/freeModelOverrides";
 export {
   // Webhooks
   getWebhooks,

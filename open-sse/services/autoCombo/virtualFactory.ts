@@ -25,6 +25,7 @@ import { filterCredentialUnhealthyCandidates } from "./credentialHealthFilter";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { filterExcludedCandidates } from "./candidateOverrides";
 import { getExcludedConnectionIds } from "@/lib/db/autoCandidateOverrides";
+import { getFreeModelTypeOverrides } from "@/lib/db/freeModelOverrides";
 import {
   filterResilienceBlockedCandidates,
   SYNTHETIC_NOAUTH_CONNECTION_ID as RESILIENCE_NOAUTH_CONNECTION_ID,
@@ -483,12 +484,20 @@ export async function createVirtualAutoCombo(
 
   // Steady-free pass for `auto/*:free` pools: drop candidates the documented free
   // catalog flags as needing a signup deposit / credit plan (one-time-initial,
-  // e.g. nvidia/deepseek, and recurring-credit). Filtered purely by catalog freeType
+  // e.g. deepseek, and recurring-credit). Filtered purely by catalog freeType
   // (not price), so the "false free" that 402/403/404s at request time never enters an
   // `auto/...:free` pool. Fail-open: candidates the catalog never documents pass
-  // through. Only active when the caller asks for a `:free` tier — other tiers unchanged.
+  // through. Runtime overrides (`free_model_type_overrides`, migration 134) — e.g. an
+  // operator reclassifying nvidia to recurring-uncapped — REPLACE the compiled catalog's
+  // freeType for those exact models, so the reclassification takes effect without a
+  // rebuild/redeploy. Only active when the caller asks for a `:free` tier — other tiers
+  // unchanged.
   if (spec?.tier === "free") {
-    const steadyFreeFilteredPool = filterNonSteadyFreeCandidates(candidatePool);
+    const freeTypeOverrides = getFreeModelTypeOverrides();
+    const steadyFreeFilteredPool = filterNonSteadyFreeCandidates(
+      candidatePool,
+      freeTypeOverrides.size > 0 ? freeTypeOverrides : undefined
+    );
     if (steadyFreeFilteredPool !== candidatePool) {
       candidatePool.length = 0;
       candidatePool.push(...steadyFreeFilteredPool);
