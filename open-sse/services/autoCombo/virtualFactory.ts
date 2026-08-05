@@ -20,6 +20,7 @@ import type { AutoVariant } from "./autoPrefix";
 import { buildFamilyCandidateFilter, type ModelFamily } from "./modelFamily";
 import { getHiddenModelsByProvider } from "@/models";
 import { filterPaidOnlyCandidates } from "./paidModelFilter";
+import { filterNonSteadyFreeCandidates } from "./freeModelFilter";
 import { filterCredentialUnhealthyCandidates } from "./credentialHealthFilter";
 import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
 import { filterExcludedCandidates } from "./candidateOverrides";
@@ -478,6 +479,20 @@ export async function createVirtualAutoCombo(
   if (overrideFilteredPool !== candidatePool) {
     candidatePool.length = 0;
     candidatePool.push(...overrideFilteredPool);
+  }
+
+  // Steady-free pass for `auto/*:free` pools: drop candidates the documented free
+  // catalog flags as needing a signup deposit / credit plan (one-time-initial,
+  // e.g. nvidia/deepseek, and recurring-credit). Filtered purely by catalog freeType
+  // (not price), so the "false free" that 402/403/404s at request time never enters an
+  // `auto/...:free` pool. Fail-open: candidates the catalog never documents pass
+  // through. Only active when the caller asks for a `:free` tier — other tiers unchanged.
+  if (spec?.tier === "free") {
+    const steadyFreeFilteredPool = filterNonSteadyFreeCandidates(candidatePool);
+    if (steadyFreeFilteredPool !== candidatePool) {
+      candidatePool.length = 0;
+      candidatePool.push(...steadyFreeFilteredPool);
+    }
   }
 
   if (candidatePool.length === 0) {
