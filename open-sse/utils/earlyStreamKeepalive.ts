@@ -28,6 +28,7 @@
 
 const ENCODER = new TextEncoder();
 const KEEPALIVE_FRAME = ENCODER.encode(": omniroute-keepalive\n\n");
+const DONE_FRAME = ENCODER.encode("data: [DONE]\n\n");
 // OpenAI-compatible keepalive: a syntactically valid empty streaming chunk.
 // Some OpenAI-compatible clients parse every non-empty SSE line as JSON and
 // reject legal SSE comments before their first provider chunk arrives.
@@ -168,6 +169,19 @@ export type EarlyStreamKeepaliveOptions = {
    * instead — see the doc comment on the default ERROR_FRAME above for why.
    */
   errorFrame?: Uint8Array;
+  /**
+   * When true, an OpenAI-Chat-Completions `data: [DONE]\n\n` terminator is enqueued
+   * right after ANY error frame the slow path emits (handler rejection, upstream
+   * stream death with zero bytes forwarded, or a late non-SSE JSON error). OpenAI
+   * clients (the openai-node SDK's stream iterator, Copilot, Cursor, etc.) treat the
+   * stream as complete when the `data: [DONE]` sentinel arrives; without it, an
+   * error-only stream ends abruptly and the client reports a dropped/truncated
+   * connection instead of surfacing the error. Defaults to false (today's behavior)
+   * — the option is opt-in for exactly the Chat Completions route, whose protocol
+   * always terminates with `[DONE]`. Anthropic (event: error) and the Responses API
+   * (discriminated `type` field) terminate differently and must NOT set this.
+   */
+  emitDoneAfterError?: boolean;
 };
 
 /**
@@ -177,8 +191,7 @@ export type EarlyStreamKeepaliveOptions = {
  * type-check. A string discriminant narrows both branches under the same settings.
  */
 type SettledHandler =
-  | { status: "fulfilled"; response: Response }
-  | { status: "rejected"; error: unknown };
+  { status: "fulfilled"; response: Response } | { status: "rejected"; error: unknown };
 
 export async function withEarlyStreamKeepalive(
   handlerPromise: Promise<Response>,
@@ -191,6 +204,7 @@ export async function withEarlyStreamKeepalive(
   const startupFrame = options.startupFrame ?? keepaliveFrame;
   const extraHeaders = options.extraHeaders ?? {};
   const errorFrame = options.errorFrame ?? ERROR_FRAME;
+  const emitDoneAfterError = options.emitDoneAfterError ?? false;
   // Single source of truth for whether THIS route's error framing uses a named SSE
   // `event: error` line (Anthropic) or a plain `data:` line (OpenAI Chat Completions /
   // Responses) — derived from errorFrame itself so the dynamic real-upstream-body case
@@ -199,6 +213,22 @@ export async function withEarlyStreamKeepalive(
 
   // Settle into a tagged result so neither race branch leaves an unhandled
   // rejection when the threshold timer wins.
+  // Emit an error frame followed by the optional OpenAI-Chat-Completions [DONE]
+  // terminator, ensuring the client sees a complete, well-terminated stream.
+  const enqueueError = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    frame: Uint8Array
+  ) => {
+    controller.enqueue(frame);
+    if (emitDoneAfterError) {
+      try {
+        controller.enqueue(DONE_FRAME);
+      } catch {
+        /* stream closed */
+      }
+    }
+  };
+
   const settled: Promise<SettledHandler> = handlerPromise.then(
     (response) => ({ status: "fulfilled" as const, response }),
     (error) => ({ status: "rejected" as const, error })
@@ -287,7 +317,7 @@ export async function withEarlyStreamKeepalive(
 
         if (result.status === "rejected") {
           // Handler rejected — emit a generic error frame (never the raw error/stack).
-          controller.enqueue(errorFrame);
+          enqueueError(controller, errorFrame);
         } else {
           const response = result.response;
           const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -313,7 +343,7 @@ export async function withEarlyStreamKeepalive(
               // the SSE stream. Silently close instead; the client will see
               // the stream end naturally.
               if (bytesForwarded === 0) {
-                controller.enqueue(errorFrame);
+                enqueueError(controller, errorFrame);
               }
             }
           } else {
@@ -328,14 +358,14 @@ export async function withEarlyStreamKeepalive(
             const framed = errorFrameUsesNamedEvent
               ? `event: error\ndata: ${dataLine}\n\n`
               : `data: ${dataLine}\n\n`;
-            controller.enqueue(ENCODER.encode(framed));
+            enqueueError(controller, ENCODER.encode(framed));
           }
         }
       } catch {
         // Defensive: never surface a raw error/stack to the client.
         if (!aborted) {
           try {
-            controller.enqueue(errorFrame);
+            enqueueError(controller, errorFrame);
           } catch {
             /* consumer gone */
           }

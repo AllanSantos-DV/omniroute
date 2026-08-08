@@ -339,6 +339,68 @@ test("errorFrame option overrides the default Anthropic-style event: error frame
   assert.match(body, /"error":\{"message":"rate limited","type":"rate_limit"\}/);
 });
 
+// The slow-path OpenAI-format error must be terminated with `data: [DONE]` when
+// emitDoneAfterError is set — without it, the openai-node SDK / Copilot / Cursor
+// wait for the [DONE] sentinel that never arrives and report a dropped connection
+// instead of surfacing the error (the "connection fell" symptom on provider exhaust).
+test("emitDoneAfterError terminates the error frame with data: [DONE] (#incident)", async () => {
+  const slowFail = new Promise<Response>((resolve) => {
+    setTimeout(
+      () =>
+        resolve(
+          new Response(JSON.stringify({ error: { message: "rate limited", type: "rate_limit" } }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" },
+          })
+        ),
+      80
+    );
+  });
+
+  const result = await withEarlyStreamKeepalive(slowFail, {
+    thresholdMs: 20,
+    intervalMs: 20,
+    errorFrame: OPENAI_CHAT_ERROR_FRAME,
+    emitDoneAfterError: true,
+  });
+  assert.equal(result.status, 200);
+
+  const body = await readAll(result);
+  assert.match(body, /"error":\{"message":"rate limited","type":"rate_limit"\}/);
+  // After the error data: line, a terminal data: [DONE] must be the final SSE event.
+  assert.match(
+    body,
+    /data: \[DONE\]\s*$/,
+    "error stream must be [DONE]-terminated for OpenAI clients"
+  );
+  // The Anthropic event: error line must not appear.
+  assert.doesNotMatch(body, /^event: /m);
+});
+
+// When emitDoneAfterError is off (default), behavior is unchanged: no [DONE].
+test("emitDoneAfterError defaults to off (no [DONE] injected)", async () => {
+  const slowFail = new Promise<Response>((resolve) => {
+    setTimeout(
+      () =>
+        resolve(
+          new Response(JSON.stringify({ error: { message: "rate limited", type: "rate_limit" } }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" },
+          })
+        ),
+      80
+    );
+  });
+
+  const result = await withEarlyStreamKeepalive(slowFail, {
+    thresholdMs: 20,
+    intervalMs: 20,
+    errorFrame: OPENAI_CHAT_ERROR_FRAME,
+  });
+  const body = await readAll(result);
+  assert.doesNotMatch(body, /data: \[DONE\]/);
+});
+
 // #2544: a fast rejection must propagate so the route's normal error handling runs —
 // it must not be silently turned into a 200 stream.
 test("fast handler rejection propagates instead of being swallowed (#2544)", async () => {

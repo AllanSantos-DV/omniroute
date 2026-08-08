@@ -135,7 +135,9 @@ export async function POST(request) {
           if (!shapeCheck.success) {
             const issue = shapeCheck.error.issues[0];
             const field = issue?.path?.length ? issue.path.join(".") : "body";
-            return finishAdmission(errorResponse(400, `${field}: ${issue?.message ?? "Invalid request"}`));
+            return finishAdmission(
+              errorResponse(400, `${field}: ${issue?.message ?? "Invalid request"}`)
+            );
           }
         }
 
@@ -198,6 +200,7 @@ export async function POST(request) {
         keepaliveFrame: OPENAI_KEEPALIVE_FRAME,
         startupFrame: OPENAI_STARTUP_FRAME,
         errorFrame: OPENAI_CHAT_ERROR_FRAME,
+        emitDoneAfterError: true,
         extraHeaders: { "X-Correlation-Id": reqId },
       });
       return withCompressionHeaderEcho(streamedResponse, compressionRequestHeader);
